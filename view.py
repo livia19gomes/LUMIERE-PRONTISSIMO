@@ -71,8 +71,9 @@ def cadastro_usuario():
     if not data:
         return jsonify({"error": "JSON vazio"}), 400
 
-    # Verifica autenticação (opcional para cadastro público de clientes)
     token = request.headers.get('Authorization')
+    id_usuario_logado = None
+    tipo_usuario_logado = None
 
     # Se tem token, valida quem está cadastrando
     if token:
@@ -88,8 +89,6 @@ def cadastro_usuario():
             cur.close()
         except:
             tipo_usuario_logado = None
-    else:
-        tipo_usuario_logado = None  # Cadastro público
 
     # Campos básicos obrigatórios
     campos_basicos = ['nome', 'email', 'telefone', 'senha']
@@ -135,10 +134,10 @@ def cadastro_usuario():
 
     senha_hashed = generate_password_hash(senha)
 
-    # Insere o novo usuário
+    # Insere o novo usuário com vínculo de quem cadastrou
     cur.execute(
-        "INSERT INTO CADASTRO (NOME, EMAIL, TELEFONE, SENHA, CATEGORIA, TIPO, ATIVO) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (nome, email, telefone, senha_hashed, categoria, tipo, True)
+        "INSERT INTO CADASTRO (NOME, EMAIL, TELEFONE, SENHA, CATEGORIA, TIPO, ATIVO, CADASTRADO_POR) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (nome, email, telefone, senha_hashed, categoria, tipo, True, id_usuario_logado)
     )
     con.commit()
     cur.close()
@@ -199,15 +198,22 @@ def listar_usuarios():
                 """, (id_usuario,))
 
         elif tipo_usuario == 'profissional':
+            # PROFISSIONAL vê clientes que ELE cadastrou OU que têm agendamento com ele
             cur.execute("""
                 SELECT DISTINCT 
                     C.ID_CADASTRO, C.NOME, C.EMAIL, C.TELEFONE, C.TIPO, C.CATEGORIA, C.ATIVO
                 FROM CADASTRO C
-                INNER JOIN AGENDA A ON A.ID_CLIENTE = C.ID_CADASTRO
-                WHERE A.ID_CADASTRO = ?
+                WHERE (
+                    C.CADASTRADO_POR = ?
+                    OR EXISTS (
+                        SELECT 1 FROM AGENDA A 
+                        WHERE A.ID_CLIENTE = C.ID_CADASTRO 
+                        AND A.ID_CADASTRO = ?
+                    )
+                )
                 AND LOWER(C.TIPO) = 'usuario'
                 ORDER BY C.NOME
-            """, (id_usuario,))
+            """, (id_usuario, id_usuario))
 
         else:
             cur.close()
@@ -858,7 +864,7 @@ def painel_admin():
     if request.method == 'GET' and not request.args.get('data_inicial'):
         return render_template('painel_administrativo.html')
 
-    # Obtém as datas do GET ou POST JSON
+    # Obtém datas do GET ou POST JSON
     if request.method == 'GET':
         data_inicial = request.args.get('data_inicial')
         data_final = request.args.get('data_final')
@@ -867,7 +873,7 @@ def painel_admin():
         data_inicial = dados.get('data_inicial')
         data_final = dados.get('data_final')
 
-    # Define intervalo padrão para hoje caso datas não sejam informadas
+    # Define intervalo padrão para hoje se datas não informadas
     if not data_inicial or not data_final:
         hoje = date.today()
         data_inicial_dt = datetime.combine(hoje, datetime.min.time())
@@ -891,7 +897,7 @@ def painel_admin():
 
         cur = con.cursor()
 
-        # Obtém o tipo de usuário (adm, profissional, usuario)
+        # Obtém o tipo de usuário
         cur.execute("SELECT tipo FROM CADASTRO WHERE id_cadastro = ?", (id_usuario,))
         resultado = cur.fetchone()
         if not resultado:
@@ -906,13 +912,13 @@ def painel_admin():
             return jsonify({"error": "Acesso negado. Apenas administradores e profissionais podem acessar o painel."}), 403
 
         if tipo_usuario == 'adm':
-            # ADM: conta apenas RESERVAS FEITAS POR CLIENTES (ID_CLIENTE não nulo)
+            # ADM: TOTAL DE AGENDAMENTOS feitos por clientes
             cur.execute("""
                 SELECT COUNT(*) FROM AGENDA
                 WHERE DATA_HORA >= ? AND DATA_HORA <= ? 
                 AND ID_CLIENTE IS NOT NULL
             """, (data_inicial_str, data_final_str))
-            numero_clientes_agendou = cur.fetchone()[0] or 0
+            total_agendamentos = cur.fetchone()[0] or 0
 
             # Quantidade de clientes ÚNICOS que fizeram reserva
             cur.execute("""
@@ -922,12 +928,13 @@ def painel_admin():
             """, (data_inicial_str, data_final_str))
             quantidade_clientes = cur.fetchone()[0] or 0
 
-            # Faturamento de TODAS as reservas (com e sem ID_CLIENTE)
+            # Faturamento de todas as reservas vinculadas a clientes
             cur.execute("""
                 SELECT S.VALOR
                 FROM AGENDA A
                 INNER JOIN SERVICO S ON S.ID_SERVICO = A.ID_SERVICO
                 WHERE A.DATA_HORA >= ? AND A.DATA_HORA <= ?
+                AND A.ID_CLIENTE IS NOT NULL
             """, (data_inicial_str, data_final_str))
 
             rows = cur.fetchall()
@@ -937,14 +944,14 @@ def painel_admin():
                     faturamento_total += float(row[0])
 
         else:
-            # PROFISSIONAL: conta apenas reservas de clientes COM ELE
+            # PROFISSIONAL: TOTAL DE AGENDAMENTOS de clientes com ele
             cur.execute("""
                 SELECT COUNT(*) FROM AGENDA
                 WHERE DATA_HORA >= ? AND DATA_HORA <= ? 
                 AND ID_CADASTRO = ?
                 AND ID_CLIENTE IS NOT NULL
             """, (data_inicial_str, data_final_str, id_usuario))
-            numero_clientes_agendou = cur.fetchone()[0] or 0
+            total_agendamentos = cur.fetchone()[0] or 0
 
             # Clientes únicos que reservaram COM ELE
             cur.execute("""
@@ -955,13 +962,14 @@ def painel_admin():
             """, (data_inicial_str, data_final_str, id_usuario))
             quantidade_clientes = cur.fetchone()[0] or 0
 
-            # Faturamento apenas dos serviços DELE
+            # Faturamento apenas dos serviços DELE vinculados a clientes
             cur.execute("""
                 SELECT S.VALOR
                 FROM AGENDA A
                 INNER JOIN SERVICO S ON S.ID_SERVICO = A.ID_SERVICO
                 WHERE A.DATA_HORA >= ? AND A.DATA_HORA <= ? 
                 AND A.ID_CADASTRO = ?
+                AND A.ID_CLIENTE IS NOT NULL
             """, (data_inicial_str, data_final_str, id_usuario))
 
             rows = cur.fetchall()
@@ -979,7 +987,7 @@ def painel_admin():
                 'data_inicial': data_inicial or hoje.strftime('%Y-%m-%d'),
                 'data_final': data_final or hoje.strftime('%Y-%m-%d')
             },
-            'numero_clientes_agendou': numero_clientes_agendou,
+            'total_agendamentos': total_agendamentos,
             'quantidade_clientes': quantidade_clientes,
             'faturamento_total': round(faturamento_total, 2)
         })
@@ -996,133 +1004,34 @@ def painel_admin():
             'detalhes': traceback.format_exc()
         }), 500
 
-@app.route('/relatorio-faturamento', methods=['GET'])
-def relatorio_faturamento():
-    try:
-        cur = con.cursor()
-
-        data_inicial = request.args.get('data_inicial')
-        data_final = request.args.get('data_final')
-
-        if not data_inicial or not data_final:
-            hoje = date.today()
-            data_inicial = hoje.isoformat()
-            data_final = hoje.isoformat()
-
-        # Converte para datetime com hora completa
-        data_inicial_dt = datetime.strptime(data_inicial, '%Y-%m-%d').replace(hour=0, minute=0, second=0)
-        data_final_dt = datetime.strptime(data_final, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
-
-        # Formato para Firebird
-        data_inicial_str = data_inicial_dt.strftime('%Y-%m-%d %H:%M:%S')
-        data_final_str = data_final_dt.strftime('%Y-%m-%d %H:%M:%S')
-
-        cur.execute(f"""
-            SELECT 
-                S.DESCRICAO, 
-                COUNT(A.ID_AGENDA) AS qtd, 
-                CAST(COALESCE(S.VALOR, 0) AS DOUBLE PRECISION) AS valor_unitario
-            FROM AGENDA A
-            JOIN SERVICO S ON S.ID_SERVICO = A.ID_SERVICO
-            WHERE A.DATA_HORA >= '{data_inicial_str}' AND A.DATA_HORA <= '{data_final_str}'
-            GROUP BY S.DESCRICAO, S.VALOR
-            ORDER BY S.DESCRICAO
-        """)
-
-        resultados = cur.fetchall()
-        cur.close()
-
-        # Cria o PDF
-        buffer = BytesIO()
-        pdf = canvas.Canvas(buffer, pagesize=A4)
-        largura, altura = A4
-
-        # Cabeçalho
-        pdf.setTitle("Relatório de Faturamento")
-        pdf.setFont("Helvetica-Bold", 16)
-        pdf.drawString(50, altura - 50, "Relatório de Faturamento")
-
-        pdf.setFont("Helvetica", 11)
-        pdf.drawString(50, altura - 75, f"Período: {data_inicial} até {data_final}")
-
-        # Linha separadora
-        pdf.line(50, altura - 85, largura - 50, altura - 85)
-
-        # Cabeçalho da tabela
-        y = altura - 110
-        pdf.setFont("Helvetica-Bold", 12)
-        pdf.drawString(50, y, "Serviço")
-        pdf.drawString(250, y, "Qtd.")
-        pdf.drawString(330, y, "Valor Unit.")
-        pdf.drawString(450, y, "Total")
-
-        # Linha após cabeçalho
-        pdf.line(50, y - 5, largura - 50, y - 5)
-
-        y -= 25
-        total_geral = 0.0
-
-        # Dados
-        pdf.setFont("Helvetica", 11)
-
-        if resultados and len(resultados) > 0:
-            for servico, qtd, valor_unitario in resultados:
-                # Converte valores
-                qtd = int(qtd) if qtd else 0
-                valor_unitario = float(valor_unitario) if valor_unitario else 0.0
-                total_servico = qtd * valor_unitario
-                total_geral += total_servico
-
-                # Verifica se precisa de nova página
-                if y < 100:
-                    pdf.showPage()
-                    pdf.setFont("Helvetica", 11)
-                    y = altura - 50
-
-                pdf.drawString(50, y, normalizar_texto(servico) if servico else "Sem descrição")
-                pdf.drawString(260, y, str(qtd))
-                pdf.drawString(330, y, f"R$ {valor_unitario:.2f}")
-                pdf.drawString(450, y, f"R$ {total_servico:.2f}")
-                y -= 20
-        else:
-            pdf.setFont("Helvetica-Oblique", 11)
-            pdf.drawString(50, y, "Nenhum faturamento encontrado no período.")
-            y -= 20
-
-        # Linha antes do total
-        y -= 10
-        pdf.line(50, y, largura - 50, y)
-
-        # Total geral
-        y -= 25
-        pdf.setFont("Helvetica-Bold", 14)
-        pdf.drawString(50, y, f"Total Faturamento: R$ {total_geral:.2f}")
-
-        # Rodapé
-        pdf.setFont("Helvetica", 8)
-        pdf.drawString(50, 30, f"Gerado em: {datetime.now().strftime('%d/%m/%Y às %H:%M')}")
-
-        pdf.save()
-        buffer.seek(0)
-
-        return send_file(
-            buffer,
-            as_attachment=True,
-            download_name=f"relatorio_faturamento_{data_inicial}_a_{data_final}.pdf",
-            mimetype='application/pdf'
-        )
-
-    except Exception as e:
-        import traceback
-        return jsonify({
-            "error": str(e),
-            "detalhes": traceback.format_exc()
-        }), 500
-
 @app.route('/relatorio-agendamentos', methods=['GET'])
 def relatorio_agendamentos():
     try:
+        # Valida o token JWT
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({"error": "Token de autenticação necessário"}), 401
+
+        token = remover_bearer(token)
+
+        payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        id_usuario = payload.get('id_usuario')
+
         cur = con.cursor()
+
+        # Obtém o tipo de usuário
+        cur.execute("SELECT tipo FROM CADASTRO WHERE id_cadastro = ?", (id_usuario,))
+        resultado = cur.fetchone()
+        if not resultado:
+            cur.close()
+            return jsonify({"error": "Usuário não encontrado"}), 404
+
+        tipo_usuario = resultado[0].lower()
+
+        # Permite acesso somente para administradores e profissionais
+        if tipo_usuario not in ['adm', 'profissional']:
+            cur.close()
+            return jsonify({"error": "Acesso negado. Apenas administradores e profissionais podem acessar o relatório."}), 403
 
         data_inicial = request.args.get('data_inicial')
         data_final = request.args.get('data_final')
@@ -1140,16 +1049,30 @@ def relatorio_agendamentos():
         data_inicial_str = data_inicial_dt.strftime('%Y-%m-%d %H:%M:%S')
         data_final_str = data_final_dt.strftime('%Y-%m-%d %H:%M:%S')
 
-        # Consulta: Clientes que fizeram agendamentos (apenas onde ID_CLIENTE não é nulo)
-        cur.execute("""
-            SELECT C.NOME, COUNT(A.ID_AGENDA) AS total_agendamentos
-            FROM AGENDA A
-            INNER JOIN CADASTRO C ON C.ID_CADASTRO = A.ID_CLIENTE
-            WHERE A.DATA_HORA >= ? AND A.DATA_HORA <= ?
-            AND A.ID_CLIENTE IS NOT NULL
-            GROUP BY C.NOME, C.ID_CADASTRO
-            ORDER BY C.NOME
-        """, (data_inicial_str, data_final_str))
+        # Consulta diferente para ADM e PROFISSIONAL
+        if tipo_usuario == 'adm':
+            # ADM: todos os agendamentos
+            cur.execute("""
+                SELECT C.NOME, COUNT(A.ID_AGENDA) AS total_agendamentos
+                FROM AGENDA A
+                INNER JOIN CADASTRO C ON C.ID_CADASTRO = A.ID_CLIENTE
+                WHERE A.DATA_HORA >= ? AND A.DATA_HORA <= ?
+                AND A.ID_CLIENTE IS NOT NULL
+                GROUP BY C.NOME, C.ID_CADASTRO
+                ORDER BY C.NOME
+            """, (data_inicial_str, data_final_str))
+        else:
+            # PROFISSIONAL: apenas agendamentos vinculados a ele
+            cur.execute("""
+                SELECT C.NOME, COUNT(A.ID_AGENDA) AS total_agendamentos
+                FROM AGENDA A
+                INNER JOIN CADASTRO C ON C.ID_CADASTRO = A.ID_CLIENTE
+                WHERE A.DATA_HORA >= ? AND A.DATA_HORA <= ?
+                AND A.ID_CLIENTE IS NOT NULL
+                AND A.ID_CADASTRO = ?
+                GROUP BY C.NOME, C.ID_CADASTRO
+                ORDER BY C.NOME
+            """, (data_inicial_str, data_final_str, id_usuario))
 
         resultados = cur.fetchall()
         cur.close()
@@ -1229,6 +1152,178 @@ def relatorio_agendamentos():
             mimetype='application/pdf'
         )
 
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "Token expirado"}), 401
+    except jwt.InvalidTokenError:
+        return jsonify({"error": "Token inválido"}), 401
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "error": str(e),
+            "detalhes": traceback.format_exc()
+        }), 500
+
+@app.route('/relatorio-faturamento', methods=['GET'])
+def relatorio_faturamento():
+    try:
+        # Valida o token JWT
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({"error": "Token de autenticação necessário"}), 401
+
+        token = remover_bearer(token)
+
+        payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        id_usuario = payload.get('id_usuario')
+
+        cur = con.cursor()
+
+        # Obtém o tipo de usuário
+        cur.execute("SELECT tipo FROM CADASTRO WHERE id_cadastro = ?", (id_usuario,))
+        resultado = cur.fetchone()
+        if not resultado:
+            cur.close()
+            return jsonify({"error": "Usuário não encontrado"}), 404
+
+        tipo_usuario = resultado[0].lower()
+
+        # Permite acesso somente para administradores e profissionais
+        if tipo_usuario not in ['adm', 'profissional']:
+            cur.close()
+            return jsonify({"error": "Acesso negado. Apenas administradores e profissionais podem acessar o relatório."}), 403
+
+        data_inicial = request.args.get('data_inicial')
+        data_final = request.args.get('data_final')
+
+        if not data_inicial or not data_final:
+            hoje = date.today()
+            data_inicial = hoje.isoformat()
+            data_final = hoje.isoformat()
+
+        # Converte para datetime com hora completa
+        data_inicial_dt = datetime.strptime(data_inicial, '%Y-%m-%d').replace(hour=0, minute=0, second=0)
+        data_final_dt = datetime.strptime(data_final, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+
+        # Formato para Firebird
+        data_inicial_str = data_inicial_dt.strftime('%Y-%m-%d %H:%M:%S')
+        data_final_str = data_final_dt.strftime('%Y-%m-%d %H:%M:%S')
+
+        # Query diferente para ADM e PROFISSIONAL
+        if tipo_usuario == 'adm':
+            # ADM: faturamento de todos os profissionais
+            cur.execute("""
+                SELECT 
+                    S.DESCRICAO, 
+                    COUNT(A.ID_AGENDA) AS qtd, 
+                    CAST(COALESCE(S.VALOR, 0) AS DOUBLE PRECISION) AS valor_unitario
+                FROM AGENDA A
+                JOIN SERVICO S ON S.ID_SERVICO = A.ID_SERVICO
+                WHERE A.DATA_HORA >= ? AND A.DATA_HORA <= ?
+                AND A.ID_CLIENTE IS NOT NULL
+                GROUP BY S.DESCRICAO, S.VALOR
+                ORDER BY S.DESCRICAO
+            """, (data_inicial_str, data_final_str))
+        else:
+            # PROFISSIONAL: apenas faturamento dos seus agendamentos
+            cur.execute("""
+                SELECT 
+                    S.DESCRICAO, 
+                    COUNT(A.ID_AGENDA) AS qtd, 
+                    CAST(COALESCE(S.VALOR, 0) AS DOUBLE PRECISION) AS valor_unitario
+                FROM AGENDA A
+                JOIN SERVICO S ON S.ID_SERVICO = A.ID_SERVICO
+                WHERE A.DATA_HORA >= ? AND A.DATA_HORA <= ?
+                AND A.ID_CLIENTE IS NOT NULL
+                AND A.ID_CADASTRO = ?
+                GROUP BY S.DESCRICAO, S.VALOR
+                ORDER BY S.DESCRICAO
+            """, (data_inicial_str, data_final_str, id_usuario))
+
+        resultados = cur.fetchall()
+        cur.close()
+
+        # Cria o PDF
+        buffer = BytesIO()
+        pdf = canvas.Canvas(buffer, pagesize=A4)
+        largura, altura = A4
+
+        # Cabeçalho
+        pdf.setTitle("Relatório de Faturamento")
+        pdf.setFont("Helvetica-Bold", 16)
+        pdf.drawString(50, altura - 50, "Relatório de Faturamento")
+
+        pdf.setFont("Helvetica", 11)
+        pdf.drawString(50, altura - 75, f"Período: {data_inicial} até {data_final}")
+
+        # Linha separadora
+        pdf.line(50, altura - 85, largura - 50, altura - 85)
+
+        # Cabeçalho da tabela
+        y = altura - 110
+        pdf.setFont("Helvetica-Bold", 12)
+        pdf.drawString(50, y, "Serviço")
+        pdf.drawString(250, y, "Qtd.")
+        pdf.drawString(330, y, "Valor Unit.")
+        pdf.drawString(450, y, "Total")
+
+        # Linha após cabeçalho
+        pdf.line(50, y - 5, largura - 50, y - 5)
+
+        y -= 25
+        total_geral = 0.0
+
+        # Dados
+        pdf.setFont("Helvetica", 11)
+
+        if resultados and len(resultados) > 0:
+            for servico, qtd, valor_unitario in resultados:
+                qtd = int(qtd) if qtd else 0
+                valor_unitario = float(valor_unitario) if valor_unitario else 0.0
+                total_servico = qtd * valor_unitario
+                total_geral += total_servico
+
+                if y < 100:
+                    pdf.showPage()
+                    pdf.setFont("Helvetica", 11)
+                    y = altura - 50
+
+                pdf.drawString(50, y, normalizar_texto(servico) if servico else "Sem descrição")
+                pdf.drawString(260, y, str(qtd))
+                pdf.drawString(330, y, f"R$ {valor_unitario:.2f}")
+                pdf.drawString(450, y, f"R$ {total_servico:.2f}")
+                y -= 20
+        else:
+            pdf.setFont("Helvetica-Oblique", 11)
+            pdf.drawString(50, y, "Nenhum faturamento encontrado no período.")
+            y -= 20
+
+        # Linha antes do total
+        y -= 10
+        pdf.line(50, y, largura - 50, y)
+
+        # Total geral
+        y -= 25
+        pdf.setFont("Helvetica-Bold", 14)
+        pdf.drawString(50, y, f"Total Faturamento: R$ {total_geral:.2f}")
+
+        # Rodapé
+        pdf.setFont("Helvetica", 8)
+        pdf.drawString(50, 30, f"Gerado em: {datetime.now().strftime('%d/%m/%Y às %H:%M')}")
+
+        pdf.save()
+        buffer.seek(0)
+
+        return send_file(
+            buffer,
+            as_attachment=True,
+            download_name=f"relatorio_faturamento_{data_inicial}_a_{data_final}.pdf",
+            mimetype='application/pdf'
+        )
+
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "Token expirado"}), 401
+    except jwt.InvalidTokenError:
+        return jsonify({"error": "Token inválido"}), 401
     except Exception as e:
         import traceback
         return jsonify({
@@ -1487,74 +1582,61 @@ def excluir_agendamento(id_agenda):
 @app.route('/horarios-disponiveis', methods=['GET'])
 def horarios_disponiveis():
     try:
-        data = request.args.get('data')  # formato: "2025-09-02"
         id_profissional = request.args.get('id_profissional')
         id_servico = request.args.get('id_servico')
+        data_escolhida = request.args.get('data')  # OPCIONAL agora
 
-        if not data or not id_profissional or not id_servico:
-            return jsonify({"error": "Parâmetros obrigatórios: data, id_profissional, id_servico"}), 400
+        if not id_profissional or not id_servico:
+            return jsonify({"error": "Parâmetros obrigatórios: id_profissional e id_servico"}), 400
 
         cur = con.cursor()
 
-        # Busca duração do serviço
-        cur.execute("SELECT DURACAO_HORAS FROM SERVICO WHERE ID_SERVICO = ?", (id_servico,))
-        result = cur.fetchone()
-        if not result:
-            cur.close()
-            return jsonify({"error": "Serviço não encontrado"}), 404
+        # Se passou data, filtra por aquele dia específico
+        if data_escolhida:
+            try:
+                data_obj = datetime.strptime(data_escolhida, '%Y-%m-%d').replace(hour=0, minute=0, second=0)
+                data_fim = data_obj.replace(hour=23, minute=59, second=59)
 
-        duracao_min = int(result[0]) if result[0] else 60
+                cur.execute("""
+                    SELECT A.DATA_HORA, S.DESCRICAO
+                    FROM AGENDA A
+                    JOIN SERVICO S ON A.ID_SERVICO = S.ID_SERVICO
+                    WHERE A.ID_CADASTRO = ?
+                    AND A.ID_SERVICO = ?
+                    AND A.DATA_HORA BETWEEN ? AND ?
+                    AND A.ID_CLIENTE IS NULL
+                    ORDER BY A.DATA_HORA ASC
+                """, (id_profissional, id_servico, data_obj, data_fim))
+            except ValueError:
+                return jsonify({"error": "Formato de data inválido. Use YYYY-MM-DD"}), 400
+        else:
+            # Sem data: mostra todos os horários disponíveis futuros
+            agora = datetime.now()
+            cur.execute("""
+                SELECT A.DATA_HORA, S.DESCRICAO
+                FROM AGENDA A
+                JOIN SERVICO S ON A.ID_SERVICO = S.ID_SERVICO
+                WHERE A.ID_CADASTRO = ?
+                AND A.ID_SERVICO = ?
+                AND A.DATA_HORA >= ?
+                AND A.ID_CLIENTE IS NULL
+                ORDER BY A.DATA_HORA ASC
+            """, (id_profissional, id_servico, agora))
 
-        # Converte a data
-        try:
-            data_obj = datetime.strptime(data, "%Y-%m-%d")
-        except ValueError:
-            cur.close()
-            return jsonify({"error": "Formato de data inválido. Use YYYY-MM-DD"}), 400
-
-        # Gera horários possíveis (ex: das 8h às 18h, de hora em hora)
-        horarios_possiveis = []
-        for hora in range(8, 19):  # 8h até 18h
-            for minuto in [0, 30]:  # a cada 30 minutos
-                horario = data_obj.replace(hour=hora, minute=minuto, second=0)
-                if horario > datetime.now():  # Só horários futuros
-                    horarios_possiveis.append(horario)
-
-        # Busca agendamentos existentes do profissional neste dia
-        inicio_dia = data_obj.replace(hour=0, minute=0, second=0)
-        fim_dia = data_obj.replace(hour=23, minute=59, second=59)
-
-        cur.execute("""
-            SELECT A.DATA_HORA, S.DURACAO_HORAS
-            FROM AGENDA A
-            JOIN SERVICO S ON A.ID_SERVICO = S.ID_SERVICO
-            WHERE A.ID_CADASTRO = ? AND A.DATA_HORA BETWEEN ? AND ?
-        """, (id_profissional, inicio_dia, fim_dia))
-
-        agendamentos = cur.fetchall()
+        rows = cur.fetchall()
         cur.close()
 
-        # Filtra horários disponíveis
         horarios_disponiveis = []
-        for horario in horarios_possiveis:
-            fim_novo = horario + timedelta(minutes=duracao_min)
-            disponivel = True
+        for row in rows:
+            horario = row[0]
+            servico = row[1]
 
-            for ag in agendamentos:
-                inicio_existente = ag[0]
-                duracao_existente = ag[1] if ag[1] else 60
-                fim_existente = inicio_existente + timedelta(minutes=int(duracao_existente))
-
-                # Verifica conflito
-                if (horario < fim_existente) and (fim_novo > inicio_existente):
-                    disponivel = False
-                    break
-
-            if disponivel:
-                horarios_disponiveis.append({
-                    "data_hora": horario.strftime("%Y-%m-%d %H:%M:%S"),
-                    "hora_formatada": horario.strftime("%H:%M")
-                })
+            horarios_disponiveis.append({
+                "data_hora": horario.strftime("%Y-%m-%d %H:%M:%S"),
+                "data_formatada": horario.strftime("%d/%m/%Y"),
+                "hora_formatada": horario.strftime("%H:%M"),
+                "servico": servico
+            })
 
         return jsonify(horarios_disponiveis), 200
 
