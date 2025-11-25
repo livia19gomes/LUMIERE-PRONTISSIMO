@@ -1707,6 +1707,57 @@ def horarios_disponiveis():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/disponibilidades', methods=['GET'])
+def listar_disponibilidades():
+    id_cadastro = request.args.get('id_cadastro')  # opcional
+    cur = con.cursor()
+    if id_cadastro:
+        cur.execute("""
+            SELECT ID, ID_CADASTRO, DIA_SEMANA, HORA_INICIO, HORA_FIM 
+            FROM DISPONIBILIDADE_PROFISSIONAL
+            WHERE ID_CADASTRO = ?
+        """, (id_cadastro,))
+    else:
+        cur.execute("""
+            SELECT ID, ID_CADASTRO, DIA_SEMANA, HORA_INICIO, HORA_FIM 
+            FROM DISPONIBILIDADE_PROFISSIONAL
+        """)
+    rows = cur.fetchall()
+    cur.close()
+    result = [{
+        "id": r[0],
+        "id_cadastro": r[1],
+        "dia_semana": r[2],
+        "hora_inicio": r[3],
+        "hora_fim": r[4]
+    } for r in rows]
+    return jsonify(result), 200
+
+@app.route('/disponibilidade/<int:id_>/', methods=['PUT'])
+def editar_disponibilidade(id_):
+    data = request.get_json()
+    dia_semana = data.get('dia_semana')
+    hora_inicio = data.get('hora_inicio')
+    hora_fim = data.get('hora_fim')
+    cur = con.cursor()
+    cur.execute("""
+        UPDATE DISPONIBILIDADE_PROFISSIONAL
+        SET DIA_SEMANA=?, HORA_INICIO=?, HORA_FIM=?
+        WHERE ID=?
+    """, (dia_semana, hora_inicio, hora_fim, id_))
+    con.commit()
+    cur.close()
+    return jsonify({"message": "Disponibilidade atualizada!"}), 200
+
+@app.route('/disponibilidade/<int:id_>/', methods=['DELETE'])
+def deletar_disponibilidade(id_):
+    cur = con.cursor()
+    cur.execute("DELETE FROM DISPONIBILIDADE_PROFISSIONAL WHERE ID=?", (id_,))
+    con.commit()
+    cur.close()
+    return jsonify({"message": "Disponibilidade deletada!"}), 200
+
+
 @app.route('/profissionais-por-servico', methods=['GET'])
 def profissionais_por_servico():
     try:
@@ -1742,16 +1793,15 @@ def profissionais_por_servico():
 def set_disponibilidade():
     try:
         data = request.get_json()
-        id_cadastro = data.get('id_cadastro')  # Use 'id_cadastro' conforme padrão do banco
+        id_cadastro = data.get('id_cadastro')
         dias = data.get('dias')  # lista de objetos com dia_semana, hora_inicio, hora_fim
 
         if not id_cadastro or not dias:
             return jsonify({"error": "Parâmetros obrigatórios: id_cadastro e dias"}), 400
 
         cur = con.cursor()
-        # Limpar disponibilidades antigas do profissional antes de inserir novas
-        cur.execute("DELETE FROM DISPONIBILIDADE_PROFISSIONAL WHERE ID_CADASTRO = ?", (id_cadastro,))
 
+        # Para cada nova disponibilidade enviada:
         for dia in dias:
             dia_semana = dia.get('dia_semana')
             hora_inicio = dia.get('hora_inicio')
@@ -1760,11 +1810,33 @@ def set_disponibilidade():
             if None in (dia_semana, hora_inicio, hora_fim):
                 continue
 
-            # Pega o próximo valor do generator manualmente
+            # Verificar overlap no banco já antes de inserir
+            cur.execute("""
+                SELECT 1 FROM DISPONIBILIDADE_PROFISSIONAL
+                WHERE ID_CADASTRO = ?
+                AND DIA_SEMANA = ?
+                AND (
+                    (HORA_INICIO < ? AND HORA_FIM > ?)    -- overlap à esquerda
+                    OR (HORA_INICIO < ? AND HORA_FIM > ?) -- overlap à direita
+                    OR (HORA_INICIO >= ? AND HORA_FIM <= ?) -- contido dentro
+                    OR (HORA_INICIO <= ? AND HORA_FIM >= ?) -- engloba existente
+                )
+            """, (
+                id_cadastro, dia_semana,
+                hora_fim, hora_fim,  # [____]---  [-----]
+                hora_inicio, hora_inicio,  # ---[____]
+                hora_inicio, hora_fim,  #    [---]
+                hora_inicio, hora_fim   # [------]
+            ))
+            conflict = cur.fetchone()
+            if conflict:
+                cur.close()
+                return jsonify({"error": f"Conflito: já existe disponibilidade neste dia que sobrepõe {hora_inicio} às {hora_fim}."}), 400
+
+            # Insere normalmente (se não houver conflito)
+            # Gerar next_id conforme seu código, se necessário
             cur.execute("SELECT NEXT VALUE FOR GEN_DISPONIBILIDADE_PROFISSIONAL FROM RDB$DATABASE")
             next_id = cur.fetchone()[0]
-
-            # Insere o registro já com o ID
             cur.execute("""
                 INSERT INTO DISPONIBILIDADE_PROFISSIONAL
                 (ID_DISPONIBILIDADE, ID_CADASTRO, DIA_SEMANA, HORA_INICIO, HORA_FIM)
