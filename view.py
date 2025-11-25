@@ -765,23 +765,24 @@ def cadastrar_agendamento():
         if not data:
             return jsonify({"error": "JSON vazio"}), 400
 
-        id_cliente = data.get('id_cliente')
         id_profissional = data.get('id_profissional')
         id_servico = data.get('id_servico')
         data_hora_str = data.get('data_hora')
 
         print(f"\n{'=' * 60}")
-        print(f"NOVA REQUISIÇÃO DE AGENDAMENTO")
-        print(f"Cliente: {id_cliente}, Profissional: {id_profissional}")
+        print(f"NOVA REQUISIÇÃO DE AGENDAMENTO (SLOT)")
+        print(f"Profissional: {id_profissional}")
         print(f"Serviço: {id_servico}, Data/Hora: {data_hora_str}")
 
-        if not id_cliente or not id_profissional or not id_servico or not data_hora_str:
-            return jsonify({"error": "Todos os campos são obrigatórios"}), 400
+        # Validação sem id_cliente
+        if not id_profissional or not id_servico or not data_hora_str:
+            return jsonify({"error": "Todos os campos são obrigatórios: id_profissional, id_servico, data_hora"}), 400
 
+        # Parse usando o formato que o frontend envia: YYYY-MM-DD HH:MM:SS
         try:
-            data_hora = datetime.strptime(data_hora_str, "%d-%m-%Y %H:%M:%S")
+            data_hora = datetime.strptime(data_hora_str, "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            return jsonify({"error": "Formato de data inválido. Use DD-MM-YYYY HH:MM:SS"}), 400
+            return jsonify({"error": "Formato de data inválido. Use YYYY-MM-DD HH:MM:SS"}), 400
 
         if data_hora < datetime.now():
             return jsonify({"error": "Não é permitido criar agendamento em horário passado"}), 400
@@ -789,7 +790,7 @@ def cadastrar_agendamento():
         # Abre cursor
         cur = con.cursor()
 
-        # Busca duração do serviço
+        # Busca duração do serviço (em horas ou decimal)
         cur.execute("SELECT DURACAO_HORAS FROM SERVICO WHERE ID_SERVICO = ?", (id_servico,))
         servico = cur.fetchone()
 
@@ -797,23 +798,35 @@ def cadastrar_agendamento():
             cur.close()
             return jsonify({"error": "Serviço não encontrado"}), 400
 
-        duracao_minutos = int(float(servico[0]) * 60)
+        # Converte DURACAO_HORAS (pode ser '1.5' ou '01:30:00' dependendo da sua base)
+        try:
+            duracao_horas = float(servico[0])
+            duracao_minutos = int(duracao_horas * 60)
+        except Exception:
+            # Se o campo vier em formato de tempo string "HH:MM:SS", tenta parsear
+            s = str(servico[0])
+            if ":" in s:
+                h, m, *_ = s.split(":")
+                duracao_minutos = int(h) * 60 + int(m)
+            else:
+                # fallback defensivo
+                duracao_minutos = 60
+
         fim_novo = data_hora + timedelta(minutes=duracao_minutos)
 
-        print(f"Novo agendamento:")
+        print(f"Novo agendamento (slot):")
         print(f"  Início: {data_hora.strftime('%d/%m/%Y %H:%M:%S')}")
         print(f"  Fim: {fim_novo.strftime('%d/%m/%Y %H:%M:%S')}")
         print(f"  Duração: {duracao_minutos} minutos")
 
-        # Define intervalo de busca: mesmo dia do agendamento (00:00 até 23:59)
+        # Busca apenas agendamentos do profissional no mesmo dia
         data_inicio_dia = data_hora.replace(hour=0, minute=0, second=0, microsecond=0)
         data_fim_dia = data_hora.replace(hour=23, minute=59, second=59, microsecond=999999)
 
         print(f"\nBuscando conflitos entre {data_inicio_dia.strftime('%d/%m/%Y')} 00:00 e 23:59...")
 
-        # Busca agendamentos existentes do profissional no mesmo dia
         cur.execute("""
-            SELECT A.ID_AGENDA, A.DATA_HORA, S.DURACAO_HORAS
+            SELECT A.ID_AGENDA, A.DATA_HORA, S.DURACAO_HORAS, A.ID_CLIENTE
             FROM AGENDA A
             JOIN SERVICO S ON A.ID_SERVICO = S.ID_SERVICO
             WHERE A.ID_CADASTRO = ?
@@ -824,28 +837,23 @@ def cadastrar_agendamento():
         agendamentos = cur.fetchall()
         print(f"Agendamentos encontrados no dia {data_hora.strftime('%d/%m/%Y')}: {len(agendamentos)}")
 
-        # Verificar conflitos
         for i, ag in enumerate(agendamentos, 1):
             id_agenda_existente = ag[0]
             inicio_existente = ag[1]
-            dur_min_existente = int(float(ag[2] if ag[2] else 1) * 60)
+            duracao_campo = ag[2]
+            dur_min_existente = int(float(duracao_campo if duracao_campo else 1) * 60)
             fim_existente = inicio_existente + timedelta(minutes=dur_min_existente)
 
             print(f"\n  [{i}] Agendamento ID {id_agenda_existente}:")
             print(f"      Início: {inicio_existente.strftime('%d/%m/%Y %H:%M:%S')}")
             print(f"      Fim: {fim_existente.strftime('%d/%m/%Y %H:%M:%S')}")
             print(f"      Duração: {dur_min_existente} minutos")
+            print(f"      ID_CLIENTE (ocupação): {ag[3]}")
 
-            # Verifica se há sobreposição de horários
-            # Conflito ocorre quando:
-            # - O novo agendamento começa antes do existente terminar E
-            # - O novo agendamento termina depois do existente começar
+            # Conflito: novo começa antes do fim do existente E novo termina depois do início existente
             tem_conflito = (data_hora < fim_existente) and (fim_novo > inicio_existente)
 
-            print(f"      Verificação de conflito:")
-            print(f"        Novo início ({data_hora.strftime('%H:%M')}) < Existente fim ({fim_existente.strftime('%H:%M')})? {data_hora < fim_existente}")
-            print(f"        Novo fim ({fim_novo.strftime('%H:%M')}) > Existente início ({inicio_existente.strftime('%H:%M')})? {fim_novo > inicio_existente}")
-            print(f"        CONFLITO: {tem_conflito}")
+            print(f"      CONFLITO: {tem_conflito}")
 
             if tem_conflito:
                 print(f"\n✗ CONFLITO DETECTADO com agendamento ID {id_agenda_existente}!")
@@ -857,14 +865,14 @@ def cadastrar_agendamento():
 
         print("\n✓ Nenhum conflito detectado no dia!")
 
-        # Inserir novo agendamento
+        # Inserir novo agendamento como SLOT (ID_CLIENTE = NULL)
         cur.execute("""
             INSERT INTO AGENDA (ID_CLIENTE, ID_CADASTRO, ID_SERVICO, DATA_HORA)
             VALUES (?, ?, ?, ?)
-        """, (id_cliente, id_profissional, id_servico, data_hora))
+        """, (None, id_profissional, id_servico, data_hora))
 
         con.commit()
-        print("✓ AGENDAMENTO CRIADO COM SUCESSO!")
+        print("✓ AGENDAMENTO (SLOT) CRIADO COM SUCESSO!")
         print(f"{'=' * 60}\n")
 
         cur.close()
@@ -1520,6 +1528,7 @@ def criar_agendamento():
         if not all([id_profissional, id_servico, data_hora_str]):
             return jsonify({"error": "Todos os campos são obrigatórios"}), 400
 
+        # Parse da data
         try:
             data_hora = datetime.strptime(data_hora_str, "%Y-%m-%d %H:%M:%S")
         except ValueError:
@@ -1530,80 +1539,105 @@ def criar_agendamento():
 
         cur = con.cursor()
 
-        # Verifica duração do serviço
-        cur.execute("SELECT DURACAO_HORAS FROM SERVICO WHERE ID_SERVICO = ?", (id_servico,))
-        result = cur.fetchone()
-        if not result or result[0] is None:
-            return jsonify({"error": "Serviço não encontrado ou sem duração cadastrada"}), 400
+        # 1️⃣ Primeiro: verificar se o SLOT existe (livre)
+        cur.execute("""
+            SELECT ID_AGENDA
+            FROM AGENDA
+            WHERE ID_CADASTRO = ?
+              AND ID_SERVICO = ?
+              AND DATA_HORA = ?
+              AND ID_CLIENTE IS NULL
+        """, (id_profissional, id_servico, data_hora))
 
-        duracao_min = int(result[0])
-        fim_agendamento = data_hora + timedelta(minutes=duracao_min)
+        slot = cur.fetchone()
 
-        # Verifica conflito de horários do profissional
+        if not slot:
+            return jsonify({"error": "Este horário não está disponível para agendamento"}), 400
+
+        id_agenda = slot[0]
+
+        # 2️⃣ Verificar conflitos SOMENTE com agendamentos já OCUPADOS
         cur.execute("""
             SELECT A.DATA_HORA, S.DURACAO_HORAS
             FROM AGENDA A
             JOIN SERVICO S ON A.ID_SERVICO = S.ID_SERVICO
             WHERE A.ID_CADASTRO = ?
+              AND A.ID_CLIENTE IS NOT NULL
         """, (id_profissional,))
 
         agendamentos = cur.fetchall()
+
+        # Buscar duração real do serviço
+        cur.execute("SELECT DURACAO_HORAS FROM SERVICO WHERE ID_SERVICO = ?", (id_servico,))
+        r = cur.fetchone()
+        duracao_min = int(float(r[0]))
+        fim_novo = data_hora + timedelta(minutes=duracao_min)
+
         for ag in agendamentos:
             inicio_existente = ag[0]
-            duracao_existente = ag[1] if ag[1] else 60
+            duracao_existente = int(float(ag[1]))
             fim_existente = inicio_existente + timedelta(minutes=duracao_existente)
-            if (data_hora < fim_existente) and (fim_agendamento > inicio_existente):
+
+            # Conflito só com horários OCUPADOS
+            if (data_hora < fim_existente) and (fim_novo > inicio_existente):
                 return jsonify({"error": "O horário conflita com outro agendamento do profissional"}), 400
 
-        # Insere novo agendamento com ID_CLIENTE
+        # 3️⃣ Como deu certo, transformar o SLOT em agendamento real
         cur.execute("""
-            INSERT INTO AGENDA (ID_CADASTRO, ID_SERVICO, DATA_HORA, ID_CLIENTE)
-            VALUES (?, ?, ?, ?)
-        """, (id_profissional, id_servico, data_hora, id_cliente))
+            UPDATE AGENDA
+            SET ID_CLIENTE = ?
+            WHERE ID_AGENDA = ?
+        """, (id_cliente, id_agenda))
 
         con.commit()
         cur.close()
 
-        return jsonify({"message": "Agendamento criado com sucesso!"}), 201
+        return jsonify({"message": "Agendamento realizado com sucesso!"}), 201
 
     except Exception as e:
         import traceback
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
+
 @app.route('/agenda/meus-agendamentos', methods=['GET'])
 def listar_meus_agendamentos():
     try:
-        token = request.headers.get('Authorization')
-        if not token:
-            return jsonify({"error": "Token de autenticação necessário"}), 401
-
-        token = remover_bearer(token)
-
-        try:
-            payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-            id_cliente = payload.get('id_usuario')
-        except:
-            return jsonify({"error": "Token inválido"}), 401
-
         cur = con.cursor()
         cur.execute("""
-            SELECT A.ID_AGENDA, A.DATA_HORA, S.NOME AS SERVICO, C.NOME AS PROFISSIONAL
+            SELECT 
+                A.ID_AGENDA, 
+                A.DATA_HORA, 
+                S.DESCRICAO AS SERVICO, 
+                C.NOME AS PROFISSIONAL
             FROM AGENDA A
             JOIN SERVICO S ON A.ID_SERVICO = S.ID_SERVICO
             JOIN CADASTRO C ON A.ID_CADASTRO = C.ID_CADASTRO
-            WHERE A.ID_CLIENTE = ?
             ORDER BY A.DATA_HORA ASC
-        """, (id_cliente,))
+        """)
 
         rows = cur.fetchall()
         cur.close()
 
         agendamentos = []
         for ag in rows:
+            data_hora = ag[1]
+
+            # Se vier string, tenta converter
+            if isinstance(data_hora, str):
+                from datetime import datetime
+                try:
+                    data_hora = datetime.strptime(data_hora, "%Y-%m-%d %H:%M:%S")
+                except:
+                    pass
+
+            # Converte pra string sempre que possível
+            if hasattr(data_hora, "strftime"):
+                data_hora = data_hora.strftime("%Y-%m-%d %H:%M:%S")
+
             agendamentos.append({
                 "id_agenda": ag[0],
-                "data_hora": ag[1].strftime("%Y-%m-%d %H:%M:%S"),
+                "data_hora": data_hora,
                 "servico": ag[2],
                 "profissional": ag[3]
             })
@@ -1611,7 +1645,9 @@ def listar_meus_agendamentos():
         return jsonify(agendamentos), 200
 
     except Exception as e:
+        print("ERRO:", e)
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/agenda/<int:id_agenda>', methods=['DELETE'])
 def excluir_agendamento(id_agenda):
