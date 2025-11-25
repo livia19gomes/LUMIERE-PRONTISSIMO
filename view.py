@@ -1582,7 +1582,7 @@ def criar_agendamento():
             if (data_hora < fim_existente) and (fim_novo > inicio_existente):
                 return jsonify({"error": "O horário conflita com outro agendamento do profissional"}), 400
 
-        # 3️⃣ Como deu certo, transformar o SLOT em agendamento real
+        # 3Como deu certo, transformar o SLOT em agendamento real
         cur.execute("""
             UPDATE AGENDA
             SET ID_CLIENTE = ?
@@ -1649,7 +1649,7 @@ def listar_meus_agendamentos():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/agenda/<int:id_agenda>', methods=['DELETE'])
+@app.route('/agenda/cliente/<int:id_agenda>', methods=['DELETE'])
 def excluir_agendamento(id_agenda):
     try:
         token = request.headers.get('Authorization')
