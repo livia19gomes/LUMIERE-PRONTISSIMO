@@ -1818,158 +1818,107 @@ def excluir_horario_profissional():
 def disponibilidades_horarios():
     try:
         id_cadastro = request.args.get('id_cadastro')
-        data_escolhida = request.args.get('data')  # YYYY-MM-DD
+        data_inicial = request.args.get('data_inicial')  # YYYY-MM-DD
+        data_final = request.args.get('data_final')  # YYYY-MM-DD
 
         if not id_cadastro:
             return jsonify({"error": "id_cadastro obrigatório"}), 400
 
+        # Define período (padrão: próximos 7 dias)
+        if not data_inicial:
+            data_inicial = datetime.now().date()
+        else:
+            data_inicial = datetime.strptime(data_inicial, "%Y-%m-%d").date()
+
+        if not data_final:
+            data_final = data_inicial + timedelta(days=6)
+        else:
+            data_final = datetime.strptime(data_final, "%Y-%m-%d").date()
+
         cur = con.cursor()
 
-        # Se tem data, filtra pelo dia da semana
-        if data_escolhida:
-            data_obj = datetime.strptime(data_escolhida, "%Y-%m-%d")
-            dia_semana = data_obj.weekday() + 1  # 1=segunda, 7=domingo
+        # Buscar disponibilidade padrão (semanal)
+        cur.execute("""
+            SELECT ID_DISPONIBILIDADE, DIA_SEMANA, HORA_INICIO, HORA_FIM 
+            FROM DISPONIBILIDADE_PROFISSIONAL
+            WHERE ID_CADASTRO = ?
+        """, (id_cadastro,))
+        disponibilidades_padrao = cur.fetchall()
 
-            cur.execute("""
-                SELECT ID_DISPONIBILIDADE, DIA_SEMANA, HORA_INICIO, HORA_FIM 
-                FROM DISPONIBILIDADE_PROFISSIONAL
-                WHERE ID_CADASTRO = ? AND DIA_SEMANA = ?
-            """, (id_cadastro, dia_semana))
-        else:
-            # Próximos 7 dias
-            cur.execute("""
-                SELECT ID_DISPONIBILIDADE, DIA_SEMANA, HORA_INICIO, HORA_FIM 
-                FROM DISPONIBILIDADE_PROFISSIONAL
-                WHERE ID_CADASTRO = ?
-            """, (id_cadastro,))
-
-        disponibilidades = cur.fetchall()
-
-        if not disponibilidades:
-            cur.close()
-            return jsonify([]), 200
-
-        # Buscar agendamentos com duração
-        horarios_ocupados = set()
-
-        if data_escolhida:
-            cur.execute("""
-                SELECT A.DATA_HORA, COALESCE(S.DURACAO_HORAS, 30) as DURACAO
-                FROM AGENDA A
-                LEFT JOIN SERVICO S ON A.ID_SERVICO = S.ID_SERVICO
-                WHERE A.ID_CADASTRO = ?
-                AND CAST(A.DATA_HORA AS DATE) = ?
-                AND A.ID_CLIENTE IS NOT NULL
-            """, (id_cadastro, data_escolhida))
-
-            agendamentos = cur.fetchall()
-
-            for agendamento in agendamentos:
-                inicio = agendamento[0]
-                duracao_minutos = int(agendamento[1])
-
-                if isinstance(inicio, str):
-                    inicio = datetime.strptime(inicio, "%Y-%m-%d %H:%M:%S")
-
-                slot_atual = inicio
-                fim_agendamento = inicio + timedelta(minutes=duracao_minutos)
-
-                while slot_atual < fim_agendamento:
-                    horarios_ocupados.add(slot_atual)
-                    slot_atual += timedelta(minutes=30)
-
-        else:
-            hoje = datetime.now().date()
-            data_limite = hoje + timedelta(days=7)
-
-            cur.execute("""
-                SELECT A.DATA_HORA, COALESCE(S.DURACAO_HORAS, 30) as DURACAO
-                FROM AGENDA A
-                LEFT JOIN SERVICO S ON A.ID_SERVICO = S.ID_SERVICO
-                WHERE A.ID_CADASTRO = ?
-                AND CAST(A.DATA_HORA AS DATE) BETWEEN ? AND ?
-                AND A.ID_CLIENTE IS NOT NULL
-            """, (id_cadastro, str(hoje), str(data_limite)))
-
-            agendamentos = cur.fetchall()
-
-            for agendamento in agendamentos:
-                inicio = agendamento[0]
-                duracao_minutos = int(agendamento[1])
-
-                if isinstance(inicio, str):
-                    inicio = datetime.strptime(inicio, "%Y-%m-%d %H:%M:%S")
-
-                slot_atual = inicio
-                fim_agendamento = inicio + timedelta(minutes=duracao_minutos)
-
-                while slot_atual < fim_agendamento:
-                    horarios_ocupados.add(slot_atual)
-                    slot_atual += timedelta(minutes=30)
+        # Buscar exceções no período
+        cur.execute("""
+            SELECT ID_EXCECAO, DATA_ESPECIFICA, HORA_INICIO, HORA_FIM, TIPO
+            FROM EXCECAO_DISPONIBILIDADE
+            WHERE ID_CADASTRO = ?
+            AND DATA_ESPECIFICA BETWEEN ? AND ?
+        """, (id_cadastro, str(data_inicial), str(data_final)))
+        excecoes = cur.fetchall()
 
         cur.close()
 
-        # GERAR HORÁRIOS DISPONÍVEIS
+        # Organizar exceções por data
+        excecoes_map = {}
+        for exc in excecoes:
+            data_exc = exc[1] if isinstance(exc[1], date) else datetime.strptime(str(exc[1]), "%Y-%m-%d").date()
+            excecoes_map[data_exc] = {
+                "id": exc[0],
+                "hora_inicio": exc[2],
+                "hora_fim": exc[3],
+                "tipo": exc[4]
+            }
+
+        # Gerar lista de datas no período
         result = []
-        duracao_slot = 30
+        current_date = data_inicial
 
-        if data_escolhida:
-            for disp in disponibilidades:
-                disp_id = disp[0]
-                hora_inicio = disp[2]
-                hora_fim = disp[3]
+        while current_date <= data_final:
+            dia_semana = current_date.weekday() + 1  # 1=segunda, 7=domingo
 
-                inicio_dt = datetime.strptime(f"{data_escolhida} {hora_inicio}", "%Y-%m-%d %H:%M")
-                fim_dt = datetime.strptime(f"{data_escolhida} {hora_fim}", "%Y-%m-%d %H:%M")
+            # Verifica se tem exceção para esta data
+            if current_date in excecoes_map:
+                exc = excecoes_map[current_date]
 
-                current = inicio_dt
-                while current < fim_dt:
-                    if current not in horarios_ocupados and current > datetime.now():
+                if exc["tipo"] == "BLOQUEIO":
+                    # Data bloqueada - não exibe
+                    current_date += timedelta(days=1)
+                    continue
+                else:
+                    # Horário alterado para este dia
+                    result.append({
+                        "id": exc["id"],
+                        "tipo": "excecao",
+                        "data": current_date.strftime("%Y-%m-%d"),
+                        "data_formatada": current_date.strftime("%d/%m/%Y"),
+                        "dia_semana_nome": ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"][
+                            dia_semana - 1],
+                        "hora_inicio": exc["hora_inicio"],
+                        "hora_fim": exc["hora_fim"],
+                        "origem": "Horário modificado"
+                    })
+            else:
+                # Usa disponibilidade padrão
+                for disp in disponibilidades_padrao:
+                    if disp[1] == dia_semana:
                         result.append({
-                            "id": disp_id,
-                            "data_hora": current.strftime("%Y-%m-%d %H:%M:%S"),
-                            "data_formatada": current.strftime("%d/%m/%Y"),
-                            "hora_formatada": current.strftime("%H:%M"),
-                            "disponivel": True
+                            "id": disp[0],
+                            "tipo": "padrao",
+                            "data": current_date.strftime("%Y-%m-%d"),
+                            "data_formatada": current_date.strftime("%d/%m/%Y"),
+                            "dia_semana_nome": ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"][
+                                dia_semana - 1],
+                            "hora_inicio": disp[2],
+                            "hora_fim": disp[3],
+                            "origem": "Horário padrão"
                         })
-                    current += timedelta(minutes=duracao_slot)
 
-        else:
-            hoje = datetime.now()
-            datas = [hoje + timedelta(days=i) for i in range(7)]
-
-            for data_considerada in datas:
-                dia_semana = data_considerada.weekday() + 1
-
-                for disp in disponibilidades:
-                    if disp[1] != dia_semana:
-                        continue
-
-                    disp_id = disp[0]
-                    hora_inicio = disp[2]
-                    hora_fim = disp[3]
-
-                    inicio_dt = datetime.combine(data_considerada.date(),
-                                                 datetime.strptime(hora_inicio, "%H:%M").time())
-                    fim_dt = datetime.combine(data_considerada.date(),
-                                              datetime.strptime(hora_fim, "%H:%M").time())
-
-                    current = inicio_dt
-                    while current < fim_dt:
-                        if current not in horarios_ocupados and current > datetime.now():
-                            result.append({
-                                "id": disp_id,
-                                "data_hora": current.strftime("%Y-%m-%d %H:%M:%S"),
-                                "data_formatada": current.strftime("%d/%m/%Y"),
-                                "hora_formatada": current.strftime("%H:%M"),
-                                "disponivel": True
-                            })
-                        current += timedelta(minutes=duracao_slot)
+            current_date += timedelta(days=1)
 
         return jsonify(result), 200
 
     except Exception as e:
         print(f"ERRO: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
@@ -1996,7 +1945,6 @@ def deletar_disponibilidade(id_):
     con.commit()
     cur.close()
     return jsonify({"message": "Disponibilidade deletada!"}), 200
-
 
 @app.route('/profissionais-por-servico', methods=['GET'])
 def profissionais_por_servico():
@@ -2027,7 +1975,6 @@ def profissionais_por_servico():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 @app.route('/disponibilidade/profissional', methods=['POST'])
 def set_disponibilidade():
@@ -2089,3 +2036,141 @@ def set_disponibilidade():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/disponibilidade/dia-especifico', methods=['PUT'])
+def editar_dia_especifico():
+    try:
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({"error": "Token necessário"}), 401
+
+        token = remover_bearer(token)
+        payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        id_usuario = payload.get('id_usuario')
+
+        data = request.get_json()
+        data_especifica = data.get('data')  # YYYY-MM-DD
+        hora_inicio = data.get('hora_inicio')  # HH:MM
+        hora_fim = data.get('hora_fim')  # HH:MM
+
+        if not all([data_especifica, hora_inicio, hora_fim]):
+            return jsonify({"error": "Campos obrigatórios: data, hora_inicio, hora_fim"}), 400
+
+        data_obj = datetime.strptime(data_especifica, "%Y-%m-%d").date()
+
+        if data_obj < datetime.now().date():
+            return jsonify({"error": "Não é possível editar datas passadas"}), 400
+
+        cur = con.cursor()
+
+        # Verifica se já existe exceção para esta data
+        cur.execute("""
+            SELECT ID_EXCECAO FROM EXCECAO_DISPONIBILIDADE
+            WHERE ID_CADASTRO = ? AND DATA_ESPECIFICA = ?
+        """, (id_usuario, str(data_obj)))
+
+        excecao_existente = cur.fetchone()
+
+        if excecao_existente:
+            # Atualiza exceção existente
+            cur.execute("""
+                UPDATE EXCECAO_DISPONIBILIDADE
+                SET HORA_INICIO = ?, HORA_FIM = ?, TIPO = 'ALTERACAO'
+                WHERE ID_EXCECAO = ?
+            """, (hora_inicio, hora_fim, excecao_existente[0]))
+        else:
+            # Cria nova exceção
+            cur.execute("SELECT NEXT VALUE FOR GEN_EXCECAO_DISPONIBILIDADE FROM RDB$DATABASE")
+            next_id = cur.fetchone()[0]
+
+            cur.execute("""
+                INSERT INTO EXCECAO_DISPONIBILIDADE 
+                (ID_EXCECAO, ID_CADASTRO, DATA_ESPECIFICA, HORA_INICIO, HORA_FIM, TIPO)
+                VALUES (?, ?, ?, ?, ?, 'ALTERACAO')
+            """, (next_id, id_usuario, str(data_obj), hora_inicio, hora_fim))
+
+        con.commit()
+        cur.close()
+
+        return jsonify({"message": "Horário atualizado com sucesso!"}), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/disponibilidade/dia-especifico', methods=['DELETE'])
+def bloquear_dia_especifico():
+    try:
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({"error": "Token necessário"}), 401
+
+        token = remover_bearer(token)
+        payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+        id_usuario = payload.get('id_usuario')
+
+        data_especifica = request.args.get('data')  # YYYY-MM-DD
+
+        if not data_especifica:
+            return jsonify({"error": "Parâmetro 'data' obrigatório"}), 400
+
+        data_obj = datetime.strptime(data_especifica, "%Y-%m-%d").date()
+
+        if data_obj < datetime.now().date():
+            return jsonify({"error": "Não é possível bloquear datas passadas"}), 400
+
+        cur = con.cursor()
+
+        # Verifica se já existe agendamento neste dia
+        cur.execute("""
+            SELECT COUNT(*) FROM AGENDA
+            WHERE ID_CADASTRO = ?
+            AND CAST(DATA_HORA AS DATE) = ?
+            AND ID_CLIENTE IS NOT NULL
+        """, (id_usuario, str(data_obj)))
+
+        qtd_agendamentos = cur.fetchone()[0]
+
+        if qtd_agendamentos > 0:
+            cur.close()
+            return jsonify(
+                {"error": f"Não é possível bloquear. Existem {qtd_agendamentos} agendamento(s) neste dia."}), 400
+
+        # Verifica se já tem exceção
+        cur.execute("""
+            SELECT ID_EXCECAO FROM EXCECAO_DISPONIBILIDADE
+            WHERE ID_CADASTRO = ? AND DATA_ESPECIFICA = ?
+        """, (id_usuario, str(data_obj)))
+
+        excecao_existente = cur.fetchone()
+
+        if excecao_existente:
+            # Atualiza para BLOQUEIO
+            cur.execute("""
+                UPDATE EXCECAO_DISPONIBILIDADE
+                SET TIPO = 'BLOQUEIO'
+                WHERE ID_EXCECAO = ?
+            """, (excecao_existente[0],))
+        else:
+            # Cria bloqueio
+            cur.execute("SELECT NEXT VALUE FOR GEN_EXCECAO_DISPONIBILIDADE FROM RDB$DATABASE")
+            next_id = cur.fetchone()[0]
+
+            cur.execute("""
+                INSERT INTO EXCECAO_DISPONIBILIDADE 
+                (ID_EXCECAO, ID_CADASTRO, DATA_ESPECIFICA, HORA_INICIO, HORA_FIM, TIPO)
+                VALUES (?, ?, ?, '00:00', '00:00', 'BLOQUEIO')
+            """, (next_id, id_usuario, str(data_obj)))
+
+        con.commit()
+        cur.close()
+
+        return jsonify({"message": "Dia bloqueado com sucesso!"}), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
