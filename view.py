@@ -1576,6 +1576,7 @@ def listar_meus_agendamentos():
             FROM AGENDA A
             JOIN SERVICO S ON A.ID_SERVICO = S.ID_SERVICO
             JOIN CADASTRO C ON A.ID_CADASTRO = C.ID_CADASTRO
+            WHERE A.DATA_HORA >= CURRENT_TIMESTAMP
             ORDER BY A.DATA_HORA ASC
         """)
 
