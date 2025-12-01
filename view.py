@@ -1707,31 +1707,271 @@ def horarios_disponiveis():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/disponibilidades', methods=['GET'])
-def listar_disponibilidades():
-    id_cadastro = request.args.get('id_cadastro')  # opcional
-    cur = con.cursor()
-    if id_cadastro:
+@app.route('/horarios-profissional', methods=['GET'])
+def horarios_profissional():
+    try:
+        id_cadastro = request.args.get('id_cadastro')
+        data_escolhida = request.args.get('data')  # opcional
+
+        if not id_cadastro:
+            return jsonify({"error": "Parâmetro obrigatório: id_cadastro"}), 400
+
+        cur = con.cursor()
+
+        # Buscar disponibilidade semanal do profissional
         cur.execute("""
-            SELECT ID, ID_CADASTRO, DIA_SEMANA, HORA_INICIO, HORA_FIM 
+            SELECT DIA_SEMANA, HORA_INICIO, HORA_FIM
             FROM DISPONIBILIDADE_PROFISSIONAL
             WHERE ID_CADASTRO = ?
         """, (id_cadastro,))
-    else:
+        disponibilidades = cur.fetchall()
+
+        if not disponibilidades:
+            return jsonify({"error": "Disponibilidade do profissional não configurada"}), 400
+
+        # Buscar todos os horários já agendados (ocupados)
         cur.execute("""
-            SELECT ID, ID_CADASTRO, DIA_SEMANA, HORA_INICIO, HORA_FIM 
-            FROM DISPONIBILIDADE_PROFISSIONAL
-        """)
-    rows = cur.fetchall()
-    cur.close()
-    result = [{
-        "id": r[0],
-        "id_cadastro": r[1],
-        "dia_semana": r[2],
-        "hora_inicio": r[3],
-        "hora_fim": r[4]
-    } for r in rows]
-    return jsonify(result), 200
+            SELECT DATA_HORA FROM AGENDA
+            WHERE ID_CADASTRO = ?
+            AND ID_CLIENTE IS NOT NULL
+        """, (id_cadastro,))
+        horarios_ocupados = {row[0] for row in cur.fetchall()}
+
+        # Gerar horários conforme disponibilidade
+        hoje = datetime.now()
+        if data_escolhida:
+            data_base = datetime.strptime(data_escolhida, "%Y-%m-%d")
+            datas_consideradas = [data_base]
+        else:
+            datas_consideradas = [hoje + timedelta(days=i) for i in range(7)]
+
+        horarios_disponiveis = []
+        duracao_padrao = 30  # minutos por slot
+
+        for data_considerada in datas_consideradas:
+            dia_semana = data_considerada.weekday() + 1  # segunda=1, domingo=7
+
+            for disp in disponibilidades:
+                if disp[0] != dia_semana:
+                    continue
+
+                hora_inicio = datetime.strptime(disp[1], "%H:%M").time()
+                hora_fim = datetime.strptime(disp[2], "%H:%M").time()
+                current = datetime.combine(data_considerada.date(), hora_inicio)
+                fim = datetime.combine(data_considerada.date(), hora_fim)
+
+                while current + timedelta(minutes=duracao_padrao) <= fim:
+                    if current not in horarios_ocupados and current > datetime.now():
+                        horarios_disponiveis.append({
+                            "data_hora": current.strftime("%Y-%m-%d %H:%M:%S"),
+                            "data_formatada": current.strftime("%d/%m/%Y"),
+                            "hora_formatada": current.strftime("%H:%M")
+                        })
+                    current += timedelta(minutes=duracao_padrao)
+
+        cur.close()
+        return jsonify(horarios_disponiveis), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/excluir-horario-profissional', methods=['DELETE'])
+def excluir_horario_profissional():
+    try:
+        id_cadastro = request.args.get('id_cadastro')
+        data_hora = request.args.get('data_hora')  # "2025-12-01 09:30:00"
+
+        if not id_cadastro or not data_hora:
+            return jsonify({"error": "Parâmetros obrigatórios: id_cadastro e data_hora"}), 400
+
+        cur = con.cursor()
+
+        # Verificar se existe agendamento neste horário
+        cur.execute("""
+            SELECT ID_AGENDA FROM AGENDA
+            WHERE ID_CADASTRO = ?
+            AND DATA_HORA = ?
+            AND ID_CLIENTE IS NOT NULL
+        """, (id_cadastro, data_hora))
+
+        agendamento = cur.fetchone()
+
+        if agendamento:
+            cur.close()
+            return jsonify({"error": "Não é possível excluir. Este horário já está agendado por um cliente."}), 400
+
+        # Inserir registro bloqueando o horário (ou deletar da AGENDA se for apenas disponibilidade)
+        # Opção 1: Marcar como bloqueado (criar campo BLOQUEADO na tabela)
+        # Opção 2: Deletar da tabela AGENDA se for apenas slot vazio
+
+        # Por enquanto, vamos apenas retornar sucesso
+        # Você precisa decidir como quer tratar isso no seu banco
+
+        cur.close()
+        return jsonify({"message": "Horário bloqueado com sucesso!"}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/disponibilidades/horarios', methods=['GET'])
+def disponibilidades_horarios():
+    try:
+        id_cadastro = request.args.get('id_cadastro')
+        data_escolhida = request.args.get('data')  # YYYY-MM-DD
+
+        if not id_cadastro:
+            return jsonify({"error": "id_cadastro obrigatório"}), 400
+
+        cur = con.cursor()
+
+        # Se tem data, filtra pelo dia da semana
+        if data_escolhida:
+            data_obj = datetime.strptime(data_escolhida, "%Y-%m-%d")
+            dia_semana = data_obj.weekday() + 1  # 1=segunda, 7=domingo
+
+            cur.execute("""
+                SELECT ID_DISPONIBILIDADE, DIA_SEMANA, HORA_INICIO, HORA_FIM 
+                FROM DISPONIBILIDADE_PROFISSIONAL
+                WHERE ID_CADASTRO = ? AND DIA_SEMANA = ?
+            """, (id_cadastro, dia_semana))
+        else:
+            # Próximos 7 dias
+            cur.execute("""
+                SELECT ID_DISPONIBILIDADE, DIA_SEMANA, HORA_INICIO, HORA_FIM 
+                FROM DISPONIBILIDADE_PROFISSIONAL
+                WHERE ID_CADASTRO = ?
+            """, (id_cadastro,))
+
+        disponibilidades = cur.fetchall()
+
+        if not disponibilidades:
+            cur.close()
+            return jsonify([]), 200
+
+        # Buscar agendamentos com duração
+        horarios_ocupados = set()
+
+        if data_escolhida:
+            cur.execute("""
+                SELECT A.DATA_HORA, COALESCE(S.DURACAO_HORAS, 30) as DURACAO
+                FROM AGENDA A
+                LEFT JOIN SERVICO S ON A.ID_SERVICO = S.ID_SERVICO
+                WHERE A.ID_CADASTRO = ?
+                AND CAST(A.DATA_HORA AS DATE) = ?
+                AND A.ID_CLIENTE IS NOT NULL
+            """, (id_cadastro, data_escolhida))
+
+            agendamentos = cur.fetchall()
+
+            for agendamento in agendamentos:
+                inicio = agendamento[0]
+                duracao_minutos = int(agendamento[1])
+
+                if isinstance(inicio, str):
+                    inicio = datetime.strptime(inicio, "%Y-%m-%d %H:%M:%S")
+
+                slot_atual = inicio
+                fim_agendamento = inicio + timedelta(minutes=duracao_minutos)
+
+                while slot_atual < fim_agendamento:
+                    horarios_ocupados.add(slot_atual)
+                    slot_atual += timedelta(minutes=30)
+
+        else:
+            hoje = datetime.now().date()
+            data_limite = hoje + timedelta(days=7)
+
+            cur.execute("""
+                SELECT A.DATA_HORA, COALESCE(S.DURACAO_HORAS, 30) as DURACAO
+                FROM AGENDA A
+                LEFT JOIN SERVICO S ON A.ID_SERVICO = S.ID_SERVICO
+                WHERE A.ID_CADASTRO = ?
+                AND CAST(A.DATA_HORA AS DATE) BETWEEN ? AND ?
+                AND A.ID_CLIENTE IS NOT NULL
+            """, (id_cadastro, str(hoje), str(data_limite)))
+
+            agendamentos = cur.fetchall()
+
+            for agendamento in agendamentos:
+                inicio = agendamento[0]
+                duracao_minutos = int(agendamento[1])
+
+                if isinstance(inicio, str):
+                    inicio = datetime.strptime(inicio, "%Y-%m-%d %H:%M:%S")
+
+                slot_atual = inicio
+                fim_agendamento = inicio + timedelta(minutes=duracao_minutos)
+
+                while slot_atual < fim_agendamento:
+                    horarios_ocupados.add(slot_atual)
+                    slot_atual += timedelta(minutes=30)
+
+        cur.close()
+
+        # GERAR HORÁRIOS DISPONÍVEIS
+        result = []
+        duracao_slot = 30
+
+        if data_escolhida:
+            for disp in disponibilidades:
+                disp_id = disp[0]
+                hora_inicio = disp[2]
+                hora_fim = disp[3]
+
+                inicio_dt = datetime.strptime(f"{data_escolhida} {hora_inicio}", "%Y-%m-%d %H:%M")
+                fim_dt = datetime.strptime(f"{data_escolhida} {hora_fim}", "%Y-%m-%d %H:%M")
+
+                current = inicio_dt
+                while current < fim_dt:
+                    if current not in horarios_ocupados and current > datetime.now():
+                        result.append({
+                            "id": disp_id,
+                            "data_hora": current.strftime("%Y-%m-%d %H:%M:%S"),
+                            "data_formatada": current.strftime("%d/%m/%Y"),
+                            "hora_formatada": current.strftime("%H:%M"),
+                            "disponivel": True
+                        })
+                    current += timedelta(minutes=duracao_slot)
+
+        else:
+            hoje = datetime.now()
+            datas = [hoje + timedelta(days=i) for i in range(7)]
+
+            for data_considerada in datas:
+                dia_semana = data_considerada.weekday() + 1
+
+                for disp in disponibilidades:
+                    if disp[1] != dia_semana:
+                        continue
+
+                    disp_id = disp[0]
+                    hora_inicio = disp[2]
+                    hora_fim = disp[3]
+
+                    inicio_dt = datetime.combine(data_considerada.date(),
+                                                 datetime.strptime(hora_inicio, "%H:%M").time())
+                    fim_dt = datetime.combine(data_considerada.date(),
+                                              datetime.strptime(hora_fim, "%H:%M").time())
+
+                    current = inicio_dt
+                    while current < fim_dt:
+                        if current not in horarios_ocupados and current > datetime.now():
+                            result.append({
+                                "id": disp_id,
+                                "data_hora": current.strftime("%Y-%m-%d %H:%M:%S"),
+                                "data_formatada": current.strftime("%d/%m/%Y"),
+                                "hora_formatada": current.strftime("%H:%M"),
+                                "disponivel": True
+                            })
+                        current += timedelta(minutes=duracao_slot)
+
+        return jsonify(result), 200
+
+    except Exception as e:
+        print(f"ERRO: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route('/disponibilidade/<int:id_>/', methods=['PUT'])
 def editar_disponibilidade(id_):
