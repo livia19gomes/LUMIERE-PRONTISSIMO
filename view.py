@@ -408,10 +408,11 @@ def logout():
 
 codigos_temp = {}
 
+
 @app.route('/servico', methods=['POST'])
 def cadastrar_servico():
     try:
-        # Pega o token do profissional logado
+        # Pega o token do usuário logado
         token = request.headers.get('Authorization')
         if not token:
             return jsonify({"error": "Token de autenticação necessário"}), 401
@@ -420,13 +421,13 @@ def cadastrar_servico():
 
         try:
             payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-            id_profissional = payload.get('id_usuario')
+            id_usuario_logado = payload.get('id_usuario')
         except:
             return jsonify({"error": "Token inválido"}), 401
 
-        # Verifica se é profissional ou adm
+        # Verifica tipo do usuário logado
         cur = con.cursor()
-        cur.execute("SELECT tipo FROM CADASTRO WHERE ID_CADASTRO = ?", (id_profissional,))
+        cur.execute("SELECT TIPO FROM CADASTRO WHERE ID_CADASTRO = ?", (id_usuario_logado,))
         result = cur.fetchone()
         if not result:
             cur.close()
@@ -442,15 +443,40 @@ def cadastrar_servico():
         valor = data.get('valor')
         duracao_horas = data.get('duracao_horas')
 
+        # Se for ADM, pode escolher para qual profissional cadastrar
+        # Se não informar, usa o próprio ID (ADM cadastra para ele mesmo)
+        id_profissional = data.get('id_profissional')
+
+        if tipo_usuario == 'profissional':
+            # Profissional sempre cadastra para ele mesmo
+            id_profissional = id_usuario_logado
+        elif tipo_usuario == 'adm':
+            # ADM pode escolher ou cadastrar para ele
+            if not id_profissional:
+                id_profissional = id_usuario_logado
+            else:
+                # Valida se o profissional escolhido existe
+                cur.execute(
+                    "SELECT ID_CADASTRO FROM CADASTRO WHERE ID_CADASTRO = ? AND TIPO IN ('profissional', 'adm')",
+                    (id_profissional,))
+                if not cur.fetchone():
+                    cur.close()
+                    return jsonify({"error": "Profissional escolhido não encontrado"}), 404
+
         if not descricao or valor is None or duracao_horas is None:
+            cur.close()
             return jsonify({"error": "Todos os campos são obrigatórios"}), 400
 
         # Converter para minutos
         if isinstance(duracao_horas, str):
             try:
-                horas, minutos = map(int, duracao_horas.split(":"))
-                duracao_min = horas * 60 + minutos
+                if ':' in duracao_horas:
+                    horas, minutos = map(int, duracao_horas.split(":"))
+                    duracao_min = horas * 60 + minutos
+                else:
+                    duracao_min = int(float(duracao_horas) * 60)
             except ValueError:
+                cur.close()
                 return jsonify({"error": "Formato inválido de duração (use HH:MM ou decimal)"}), 400
         else:
             duracao_min = int(float(duracao_horas) * 60)
@@ -460,11 +486,12 @@ def cadastrar_servico():
             SELECT COUNT(*) FROM SERVICO 
             WHERE DESCRICAO = ? AND ID_CADASTRO = ?
         """, (descricao, id_profissional))
+
         if cur.fetchone()[0] > 0:
             cur.close()
-            return jsonify({"error": "Você já cadastrou um serviço com esta descrição"}), 400
+            return jsonify({"error": "Este profissional já possui um serviço com esta descrição"}), 400
 
-        # Insere no banco com ID do profissional
+        # Insere no banco
         cur.execute("""
             INSERT INTO SERVICO (DESCRICAO, VALOR, DURACAO_HORAS, ID_CADASTRO)
             VALUES (?, ?, ?, ?)
@@ -478,6 +505,7 @@ def cadastrar_servico():
         import traceback
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/servico', methods=['GET'])
 def listar_servicos():
@@ -889,16 +917,35 @@ def cadastrar_agendamento():
 
         return jsonify({"error": str(e)}), 500
 
+
 @app.route('/agenda/<int:id_agenda>', methods=['DELETE'])
 def cancelar_agendamento(id_agenda):
     try:
+        # Pega o token
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({"error": "Token de autenticação necessário"}), 401
+
+        token = remover_bearer(token)
+
+        try:
+            payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            id_usuario_logado = payload.get('id_usuario')
+        except:
+            return jsonify({"error": "Token inválido"}), 401
+
+        # Verifica tipo do usuário logado
         cur = con.cursor()
+        cur.execute("SELECT TIPO FROM CADASTRO WHERE ID_CADASTRO = ?", (id_usuario_logado,))
+        result = cur.fetchone()
 
-        id_profissional = request.args.get('id_profissional')
-        if not id_profissional:
-            return jsonify({"error": "ID do profissional é obrigatório"}), 400
+        if not result:
+            cur.close()
+            return jsonify({"error": "Usuário não encontrado"}), 404
 
-        # Verifica se o agendamento existe e pertence ao profissional
+        tipo_usuario = result[0].lower()
+
+        # Verifica se o agendamento existe
         cur.execute("SELECT ID_AGENDA, ID_CADASTRO FROM AGENDA WHERE ID_AGENDA = ?", (id_agenda,))
         agendamento = cur.fetchone()
 
@@ -906,9 +953,20 @@ def cancelar_agendamento(id_agenda):
             cur.close()
             return jsonify({"error": "Agendamento não encontrado"}), 404
 
-        if int(agendamento[1]) != int(id_profissional):
+        id_profissional_agendamento = agendamento[1]
+
+        # Verifica permissão
+        if tipo_usuario == 'profissional':
+            # Profissional só pode cancelar seus próprios agendamentos
+            if int(id_profissional_agendamento) != int(id_usuario_logado):
+                cur.close()
+                return jsonify({"error": "Você não pode cancelar agendamentos de outro profissional"}), 403
+        elif tipo_usuario not in ['adm', 'administrador']:
+            # Se não for profissional nem ADM, nega acesso
             cur.close()
-            return jsonify({"error": "Você não pode cancelar agendamentos de outro profissional"}), 403
+            return jsonify({"error": "Sem permissão para cancelar agendamentos"}), 403
+
+        # ADM pode cancelar qualquer agendamento, então passa direto
 
         # Deleta o agendamento
         cur.execute("DELETE FROM AGENDA WHERE ID_AGENDA = ?", (id_agenda,))
@@ -918,8 +976,11 @@ def cancelar_agendamento(id_agenda):
         return jsonify({"message": "Agendamento cancelado com sucesso"}), 200
 
     except Exception as e:
+        import traceback
+        print(traceback.format_exc())
         con.rollback()
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/painel-admin', methods=['GET', 'POST'])
 def painel_admin():
@@ -1563,9 +1624,42 @@ def criar_agendamento():
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
+
 @app.route('/agenda/meus-agendamentos', methods=['GET'])
 def listar_meus_agendamentos():
     try:
+        from flask import request
+        import jwt
+
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({"error": "Token não fornecido"}), 401
+
+        token = auth_header.replace('Bearer ', '')
+
+        try:
+            payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            print("PAYLOAD COMPLETO:", payload)  # <- VAI MOSTRAR TODAS AS CHAVES
+
+            # Tenta pegar o ID de várias chaves possíveis
+            id_cliente = (
+                    payload.get('id_cadastro') or
+                    payload.get('user_id') or
+                    payload.get('id') or
+                    payload.get('sub') or
+                    payload.get('id_usuario')
+            )
+
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token expirado"}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "Token inválido"}), 401
+
+        if not id_cliente:
+            return jsonify({"error": "ID do cliente não encontrado no token"}), 400
+
+        print("ID_CLIENTE extraído:", id_cliente)
+
         cur = con.cursor()
         cur.execute("""
             SELECT 
@@ -1577,26 +1671,18 @@ def listar_meus_agendamentos():
             JOIN SERVICO S ON A.ID_SERVICO = S.ID_SERVICO
             JOIN CADASTRO C ON A.ID_CADASTRO = C.ID_CADASTRO
             WHERE A.DATA_HORA >= CURRENT_TIMESTAMP
+              AND A.ID_CLIENTE = ?
             ORDER BY A.DATA_HORA ASC
-        """)
+        """, (id_cliente,))
 
         rows = cur.fetchall()
         cur.close()
 
+        from datetime import datetime
         agendamentos = []
         for ag in rows:
             data_hora = ag[1]
-
-            # Se vier string, tenta converter
-            if isinstance(data_hora, str):
-                from datetime import datetime
-                try:
-                    data_hora = datetime.strptime(data_hora, "%Y-%m-%d %H:%M:%S")
-                except:
-                    pass
-
-            # Converte pra string sempre que possível
-            if hasattr(data_hora, "strftime"):
+            if isinstance(data_hora, datetime):
                 data_hora = data_hora.strftime("%Y-%m-%d %H:%M:%S")
 
             agendamentos.append({
@@ -1610,6 +1696,49 @@ def listar_meus_agendamentos():
 
     except Exception as e:
         print("ERRO:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/agenda/todos-agendamentos', methods=['GET'])
+def listar_todos_agendamentos():
+    try:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT 
+                A.ID_AGENDA, 
+                A.DATA_HORA, 
+                S.DESCRICAO AS SERVICO, 
+                S.DURACAO AS DURACAO, 
+                C.NOME AS PROFISSIONAL
+            FROM AGENDA A
+            JOIN SERVICO S ON A.ID_SERVICO = S.ID_SERVICO
+            JOIN CADASTRO C ON A.ID_CADASTRO = C.ID_CADASTRO
+            ORDER BY A.DATA_HORA ASC
+        """)
+
+        rows = cur.fetchall()
+        cur.close()
+
+        from datetime import datetime
+        agendamentos = []
+
+        for ag in rows:
+            data_hora = ag[1]
+            if isinstance(data_hora, datetime):
+                data_hora = data_hora.strftime("%Y-%m-%d %H:%M:%S")
+
+            agendamentos.append({
+                "id_agenda": ag[0],
+                "data_hora": data_hora,
+                "servico": ag[2],
+                "duracao": ag[3],        # duração do serviço
+                "profissional": ag[4]    # nome do profissional
+            })
+
+        return jsonify(agendamentos), 200
+
+    except Exception as e:
+        print("ERRO LISTAR_AGENDAMENTOS:", e)
         return jsonify({"error": str(e)}), 500
 
 @app.route('/agenda/cliente/<int:id_agenda>', methods=['DELETE'])
@@ -1923,21 +2052,97 @@ def disponibilidades_horarios():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/disponibilidade/<int:id_>/', methods=['PUT'])
+@app.route('/disponibilidade/<int:id_>', methods=['PUT'])
 def editar_disponibilidade(id_):
-    data = request.get_json()
-    dia_semana = data.get('dia_semana')
-    hora_inicio = data.get('hora_inicio')
-    hora_fim = data.get('hora_fim')
-    cur = con.cursor()
-    cur.execute("""
-        UPDATE DISPONIBILIDADE_PROFISSIONAL
-        SET DIA_SEMANA=?, HORA_INICIO=?, HORA_FIM=?
-        WHERE ID=?
-    """, (dia_semana, hora_inicio, hora_fim, id_))
-    con.commit()
-    cur.close()
-    return jsonify({"message": "Disponibilidade atualizada!"}), 200
+    try:
+        # Pega o token
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({"error": "Token de autenticação necessário"}), 401
+
+        token = remover_bearer(token)
+
+        try:
+            payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            id_usuario_logado = payload.get('id_usuario')
+        except:
+            return jsonify({"error": "Token inválido"}), 401
+
+        # Verifica tipo do usuário logado
+        cur = con.cursor()
+        cur.execute("SELECT TIPO FROM CADASTRO WHERE ID_CADASTRO = ?", (id_usuario_logado,))
+        result = cur.fetchone()
+
+        if not result:
+            cur.close()
+            return jsonify({"error": "Usuário não encontrado"}), 404
+
+        tipo_usuario = result[0].lower()
+
+        # Busca a disponibilidade que será editada
+        cur.execute("""
+            SELECT ID_CADASTRO 
+            FROM DISPONIBILIDADE_PROFISSIONAL 
+            WHERE ID = ?
+        """, (id_,))
+
+        disponibilidade = cur.fetchone()
+
+        if not disponibilidade:
+            cur.close()
+            return jsonify({"error": "Disponibilidade não encontrada"}), 404
+
+        id_profissional_dono = disponibilidade[0]
+
+        # Verifica permissão
+        if tipo_usuario == 'profissional':
+            # Profissional só pode editar seus próprios horários
+            if id_profissional_dono != id_usuario_logado:
+                cur.close()
+                return jsonify({"error": "Você não tem permissão para editar este horário"}), 403
+        elif tipo_usuario not in ['adm', 'administrador']:
+            # Se não for profissional nem ADM, nega acesso
+            cur.close()
+            return jsonify({"error": "Sem permissão para editar disponibilidades"}), 403
+
+        # Pega os dados do JSON
+        data = request.get_json()
+        dia_semana = data.get('dia_semana')
+        hora_inicio = data.get('hora_inicio')
+        hora_fim = data.get('hora_fim')
+
+        if not dia_semana or not hora_inicio or not hora_fim:
+            cur.close()
+            return jsonify({"error": "Todos os campos são obrigatórios"}), 400
+
+        # Valida formato de hora (HH:MM)
+        import re
+        if not re.match(r'^\d{2}:\d{2}$', hora_inicio) or not re.match(r'^\d{2}:\d{2}$', hora_fim):
+            cur.close()
+            return jsonify({"error": "Formato de hora inválido. Use HH:MM"}), 400
+
+        # Valida se hora_fim é maior que hora_inicio
+        if hora_inicio >= hora_fim:
+            cur.close()
+            return jsonify({"error": "Hora de término deve ser maior que hora de início"}), 400
+
+        # Atualiza a disponibilidade
+        cur.execute("""
+            UPDATE DISPONIBILIDADE_PROFISSIONAL
+            SET DIA_SEMANA = ?, HORA_INICIO = ?, HORA_FIM = ?
+            WHERE ID = ?
+        """, (dia_semana, hora_inicio, hora_fim, id_))
+
+        con.commit()
+        cur.close()
+
+        return jsonify({"message": "Disponibilidade atualizada com sucesso!"}), 200
+
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route('/disponibilidade/<int:id_>/', methods=['DELETE'])
 def deletar_disponibilidade(id_):
